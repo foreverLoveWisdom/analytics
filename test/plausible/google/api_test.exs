@@ -1,126 +1,191 @@
-defmodule Plausible.Google.ApiTest do
+defmodule Plausible.Google.APITest do
   use Plausible.DataCase, async: true
-  alias Plausible.Google.Api
-  import Plausible.TestUtils
-  import Double
+  use Plausible.Test.Support.HTTPMocker
 
-  @ok_response Jason.encode!(%{
-                 "reports" => [
-                   %{
-                     "data" => %{
-                       "rows" => [
-                         %{
-                           "dimensions" => ["20220101"],
-                           "metrics" => [%{"values" => ["1", "1", "1", "1", "1"]}]
-                         }
-                       ]
-                     }
-                   }
-                 ]
-               })
+  alias Plausible.Google
+  alias Plausible.Stats.{DateTimeRange, Query}
 
-  @empty_response Jason.encode!(%{
-                    "reports" => [%{"data" => %{"rows" => []}}]
-                  })
+  import ExUnit.CaptureLog
+  import Mox
+  setup :verify_on_exit!
 
-  describe "fetch_and_persist/4" do
-    setup [:create_user, :create_new_site]
+  setup [:create_user, :create_site]
 
-    test "will fetch and persist import data from Google Analytics", %{site: site} do
-      httpoison =
-        HTTPoison
-        |> stub(:post, fn _url, _body, _headers, _opts ->
-          {:ok, %HTTPoison.Response{status_code: 200, body: @ok_response}}
-        end)
+  describe "fetch_stats/3 errors" do
+    setup %{user: user, site: site} do
+      insert(:google_auth,
+        user: user,
+        site: site,
+        property: "sc-domain:dummy.test",
+        expires: NaiveDateTime.add(NaiveDateTime.utc_now(), 3600)
+      )
 
-      request = %{
-        dataset: "imported_visitors",
-        view_id: "123",
-        date_range: Date.range(~D[2022-01-01], ~D[2022-02-01]),
-        dimensions: ["ga:date"],
-        metrics: ["ga:users"],
-        access_token: "fake-token",
-        page_token: nil
-      }
-
-      Api.fetch_and_persist(site, request, http_client: httpoison, sleep_time: 0)
-
-      assert imported_visitor_count(site) == 1
+      :ok
     end
 
-    test "retries HTTP request up to 5 times before raising the last error", %{site: site} do
-      httpoison =
-        HTTPoison
-        |> stub(:post, fn _url, _body, _headers, _opts ->
-          {:error, %HTTPoison.Error{reason: :nxdomain}}
-        end)
-        |> stub(:post, fn _url, _body, _headers, _opts ->
-          {:error, %HTTPoison.Error{reason: :timeout}}
-        end)
-        |> stub(:post, fn _url, _body, _headers, _opts ->
-          {:error, %HTTPoison.Error{reason: :closed}}
-        end)
-        |> stub(:post, fn _url, _body, _headers, _opts ->
-          {:ok, %HTTPoison.Response{status_code: 503}}
-        end)
-        |> stub(:post, fn _url, _body, _headers, _opts ->
-          {:ok, %HTTPoison.Response{status_code: 502}}
-        end)
+    test "returns generic google_auth_error on 401/403", %{site: site} do
+      expect(
+        Plausible.HTTPClient.Mock,
+        :post,
+        fn
+          "https://www.googleapis.com/webmasters/v3/sites/sc-domain%3Adummy.test/searchAnalytics/query",
+          [{"Authorization", "Bearer 123"}],
+          %{
+            dimensionFilterGroups: [],
+            dimensions: ["query"],
+            endDate: "2022-01-05",
+            rowLimit: 5,
+            startRow: 0,
+            startDate: "2022-01-01"
+          } ->
+            {:error, %{reason: %Finch.Response{status: Enum.random([401, 403])}}}
+        end
+      )
 
-      request = %{
-        view_id: "123",
-        date_range: Date.range(~D[2022-01-01], ~D[2022-02-01]),
-        dimensions: ["ga:date"],
-        metrics: ["ga:users"],
-        access_token: "fake-token",
-        page_token: nil
-      }
+      query =
+        Query.from(site, %{"period" => "custom", "from" => "2022-01-01", "to" => "2022-01-05"})
 
-      assert_raise RuntimeError, "Google API request failed too many times", fn ->
-        Api.fetch_and_persist(site, request, http_client: httpoison, sleep_time: 0)
-      end
-
-      assert_receive({HTTPoison, :post, [_, _, _, _]})
-      assert_receive({HTTPoison, :post, [_, _, _, _]})
-      assert_receive({HTTPoison, :post, [_, _, _, _]})
-      assert_receive({HTTPoison, :post, [_, _, _, _]})
-      assert_receive({HTTPoison, :post, [_, _, _, _]})
+      assert {:error, "google_auth_error"} = Google.API.fetch_stats(site, query, {5, 0}, "")
     end
 
-    test "retries HTTP request if the rows are empty", %{site: site} do
-      httpoison =
-        HTTPoison
-        |> stub(:post, fn _url, _body, _headers, _opts ->
-          {:ok, %HTTPoison.Response{status_code: 200, body: @empty_response}}
+    test "returns whatever error code google returns on API client error", %{site: site} do
+      expect(
+        Plausible.HTTPClient.Mock,
+        :post,
+        fn
+          "https://www.googleapis.com/webmasters/v3/sites/sc-domain%3Adummy.test/searchAnalytics/query",
+          _,
+          _ ->
+            {:error, %{reason: %Finch.Response{status: 400, body: %{"error" => "some_error"}}}}
+        end
+      )
+
+      query =
+        Query.from(site, %{"period" => "custom", "from" => "2022-01-01", "to" => "2022-01-05"})
+
+      assert {:error, "some_error"} = Google.API.fetch_stats(site, query, {5, 0}, "")
+    end
+
+    test "returns generic HTTP error and logs it", %{site: site} do
+      expect(
+        Plausible.HTTPClient.Mock,
+        :post,
+        fn
+          "https://www.googleapis.com/webmasters/v3/sites/sc-domain%3Adummy.test/searchAnalytics/query",
+          _,
+          _ ->
+            {:error, Finch.Error.exception(:some_reason)}
+        end
+      )
+
+      query =
+        Query.from(site, %{"period" => "custom", "from" => "2022-01-01", "to" => "2022-01-05"})
+
+      log =
+        capture_log(fn ->
+          assert {:error, "failed_to_list_stats"} =
+                   Google.API.fetch_stats(site, query, {5, 0}, "")
         end)
-        |> stub(:post, fn _url, _body, _headers, _opts ->
-          {:ok, %HTTPoison.Response{status_code: 200, body: @ok_response}}
-        end)
 
-      request = %{
-        dataset: "imported_visitors",
-        view_id: "123",
-        date_range: Date.range(~D[2022-01-01], ~D[2022-02-01]),
-        dimensions: ["ga:date"],
-        metrics: ["ga:users"],
-        access_token: "fake-token",
-        page_token: nil
-      }
-
-      Api.fetch_and_persist(site, request, http_client: httpoison, sleep_time: 0)
-
-      assert_receive({HTTPoison, :post, [_, _, _, _]})
-      assert_receive({HTTPoison, :post, [_, _, _, _]})
-
-      assert imported_visitor_count(site) == 1
+      assert log =~
+               "Google Search Console: failed to list stats: %Finch.Error{reason: :some_reason}"
     end
   end
 
-  defp imported_visitor_count(site) do
-    Plausible.ClickhouseRepo.one(
-      from iv in "imported_visitors",
-        where: iv.site_id == ^site.id,
-        select: sum(iv.visitors)
+  test "returns error when token refresh fails", %{user: user, site: site} do
+    mock_http_with("google_auth#invalid_grant.json")
+
+    insert(:google_auth,
+      user: user,
+      site: site,
+      property: "sc-domain:dummy.test",
+      access_token: "*****",
+      refresh_token: "*****",
+      expires: NaiveDateTime.add(NaiveDateTime.utc_now(), -3600)
     )
+
+    query =
+      Query.from(site, %{"period" => "custom", "from" => "2022-01-01", "to" => "2022-01-05"})
+
+    assert {:error, "invalid_grant"} = Google.API.fetch_stats(site, query, 5, "")
+  end
+
+  test "returns error when google auth not configured", %{site: site} do
+    time_range = DateTimeRange.new!(~U[2022-01-01 00:00:00Z], ~U[2022-01-05 23:59:59Z])
+    query = %Plausible.Stats.Query{utc_time_range: time_range}
+
+    assert {:error, :google_property_not_configured} = Google.API.fetch_stats(site, query, 5, "")
+  end
+
+  describe "fetch_stats/3 with valid auth" do
+    setup %{user: user, site: site} do
+      insert(:google_auth,
+        user: user,
+        site: site,
+        property: "sc-domain:dummy.test",
+        expires: NaiveDateTime.add(NaiveDateTime.utc_now(), 3600)
+      )
+
+      :ok
+    end
+
+    test "returns name and visitor count", %{site: site} do
+      mock_http_with("google_search_console.json")
+
+      query =
+        Query.from(site, %{"period" => "custom", "from" => "2022-01-01", "to" => "2022-01-05"})
+
+      assert {:ok,
+              [
+                %{name: "keyword1", visitors: 25, ctr: 36.8, impressions: 50, position: 2.2},
+                %{name: "keyword3", visitors: 15}
+              ]} = Google.API.fetch_stats(site, query, {5, 0}, "")
+    end
+
+    test "transforms page filters to search console format", %{site: site} do
+      expect(
+        Plausible.HTTPClient.Mock,
+        :post,
+        fn
+          "https://www.googleapis.com/webmasters/v3/sites/sc-domain%3Adummy.test/searchAnalytics/query",
+          [{"Authorization", "Bearer 123"}],
+          %{
+            dimensionFilterGroups: [
+              %{filters: [%{expression: "https://dummy.test/page", dimension: "page"}]}
+            ],
+            dimensions: ["query"],
+            endDate: "2022-01-05",
+            rowLimit: 5,
+            startRow: 0,
+            startDate: "2022-01-01"
+          } ->
+            {:ok, %Finch.Response{status: 200, body: %{"rows" => []}}}
+        end
+      )
+
+      query =
+        Plausible.Stats.Query.from(site, %{
+          "period" => "custom",
+          "from" => "2022-01-01",
+          "to" => "2022-01-05",
+          "filters" => "event:page==/page"
+        })
+
+      assert {:ok, []} = Google.API.fetch_stats(site, query, {5, 0}, "")
+    end
+
+    test "returns :invalid filters when using filters that cannot be used in Search Console", %{
+      site: site
+    } do
+      query =
+        Plausible.Stats.Query.from(site, %{
+          "period" => "custom",
+          "from" => "2022-01-01",
+          "to" => "2022-01-05",
+          "filters" => "event:goal==Signup"
+        })
+
+      assert {:error, :unsupported_filters} = Google.API.fetch_stats(site, query, 5, "")
+    end
   end
 end
