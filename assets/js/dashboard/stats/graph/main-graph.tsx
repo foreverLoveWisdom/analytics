@@ -527,7 +527,7 @@ export const MainGraphContainer = React.forwardRef<
   { children: ReactNode }
 >((props, ref) => {
   return (
-    <div className="relative my-4 h-92 w-full" ref={ref}>
+    <div className="relative mt-4 mb-3 h-92 w-full" ref={ref}>
       {props.children}
     </div>
   )

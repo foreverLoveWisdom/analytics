@@ -3,10 +3,6 @@ import * as storage from '../../util/storage'
 import TopStats from './top-stats'
 import { fetchTopStats } from './fetch-top-stats'
 import { fetchMainGraph } from './fetch-main-graph'
-import { IntervalPicker, useStoredInterval } from './interval-picker'
-import StatsExport from './stats-export'
-import WithImportedSwitch from './with-imported-switch'
-import { NoticesIcon } from './notices'
 import { useDashboardStateContext } from '../../dashboard-state-context'
 import { PlausibleSite, useSiteContext } from '../../site-context'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
@@ -16,6 +12,8 @@ import { DashboardState } from '../../dashboard-state'
 import { nowForSite } from '../../util/date'
 import { getStaleTime } from '../../hooks/api-client'
 import { MainGraph, MainGraphContainer, useMainGraphWidth } from './main-graph'
+import { useGraphIntervalContext } from './graph-interval-context'
+import { useSetImportsIncluded } from './imports-included-context'
 
 // height of at least one row of top stats
 const DEFAULT_TOP_STATS_LOADING_HEIGHT_PX = 85
@@ -34,16 +32,7 @@ export default function VisitorGraph({
   const queryClient = useQueryClient()
   const startOfDay = nowForSite(site).startOf('day')
 
-  const { selectedInterval, onIntervalClick, availableIntervals } =
-    useStoredInterval({
-      site: site,
-      to: dashboardState.to,
-      from: dashboardState.from,
-      period: dashboardState.period,
-      comparison: dashboardState.comparison,
-      compare_to: dashboardState.compare_to,
-      compare_from: dashboardState.compare_from
-    })
+  const { selectedInterval } = useGraphIntervalContext()
 
   const [selectedMetric, setSelectedMetric] = useState<Metric | null>(
     getStoredMetric(site)
@@ -190,16 +179,25 @@ export default function VisitorGraph({
     }
   }, [queryClient, isRealtime])
 
-  const importedSwitchVisible = !['no_imported_data', 'out_of_range'].includes(
+  const switchVisible = !['no_imported_data', 'out_of_range'].includes(
     topStatsQuery.data?.meta.imports_skip_reason as string
   )
+  const switchDisabled =
+    topStatsQuery.data?.meta.imports_skip_reason === 'unsupported_query'
 
-  const importedIntervalUnsupportedNotice =
-    ['hour', 'minute'].includes(selectedInterval) &&
-    importedSwitchVisible &&
-    dashboardState.with_imported
-      ? 'Interval is too short to graph imported data'
-      : null
+  const setImportsIncluded = useSetImportsIncluded()
+
+  useEffect(() => {
+    if (topStatsQuery.data) {
+      setImportsIncluded({ switchVisible, switchDisabled })
+    } else {
+      setImportsIncluded(null)
+    }
+  }, [topStatsQuery.data, switchVisible, switchDisabled, setImportsIncluded])
+
+  useEffect(() => {
+    return () => setImportsIncluded(null)
+  }, [setImportsIncluded])
 
   const { heightPx } = useGuessTopStatsHeight(site, topStatsBoundary)
 
@@ -215,7 +213,7 @@ export default function VisitorGraph({
     !showFullLoader
 
   return (
-    <div className="col-span-full relative w-full bg-white rounded-md shadow dark:bg-gray-900">
+    <div className="col-span-full relative w-full bg-white rounded-md shadow-sm dark:bg-gray-900">
       <>
         <div
           id="top-stats-container"
@@ -238,42 +236,7 @@ export default function VisitorGraph({
             ></div>
           )}
         </div>
-        <div className="relative px-2">
-          {topStatsQuery.data && (
-            <div className="absolute right-4 -top-8 py-1 flex items-center gap-x-4">
-              <NoticesIcon
-                notices={
-                  [importedIntervalUnsupportedNotice].filter(
-                    (n) => !!n
-                  ) as string[]
-                }
-              />
-              {!isRealtime && (
-                <StatsExport selectedInterval={selectedInterval} />
-              )}
-              {importedSwitchVisible && (
-                <WithImportedSwitch
-                  tooltipMessage={
-                    topStatsQuery.data.meta.imports_skip_reason ===
-                    'unsupported_query'
-                      ? 'Imported data cannot be included'
-                      : topStatsQuery.data.meta.imports_included
-                        ? 'Click to exclude imported data'
-                        : 'Click to include imported data'
-                  }
-                  disabled={
-                    topStatsQuery.data.meta.imports_skip_reason ===
-                    'unsupported_query'
-                  }
-                />
-              )}
-              <IntervalPicker
-                selectedInterval={selectedInterval}
-                onIntervalClick={onIntervalClick}
-                options={availableIntervals}
-              />
-            </div>
-          )}
+        <div className="relative flex flex-col pl-3 pr-4">
           <MainGraphContainer ref={mainGraphContainer}>
             {!!mainGraphQuery.data && !!width && (
               <>
