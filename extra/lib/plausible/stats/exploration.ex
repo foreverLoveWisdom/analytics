@@ -53,13 +53,18 @@ defmodule Plausible.Stats.Exploration do
           conversion_rate_step: String.t()
         }
 
-  @spec next_steps(Query.t(), journey(), String.t(), direction()) ::
-          {:ok, [next_step()]}
-  def next_steps(query, journey, search_term \\ "", direction \\ :forward)
-      when is_direction(direction) do
+  @next_steps_defaults [search_term: "", direction: :forward, max_candidates: 10]
+
+  @spec next_steps(Query.t(), journey(), keyword()) :: {:ok, [next_step()]}
+  def next_steps(query, journey, opts \\ []) do
+    opts = Keyword.merge(@next_steps_defaults, opts)
+    direction = Keyword.fetch!(opts, :direction)
+    search_term = Keyword.fetch!(opts, :search_term)
+    max_candidates = min(Keyword.fetch!(opts, :max_candidates), 20)
+
     query
     |> Base.base_event_query()
-    |> next_steps_query(journey, search_term, direction)
+    |> next_steps_query(journey, search_term, direction, max_candidates)
     # We pass the query struct to record query metadata for
     # the CH debug console.
     |> ClickhouseRepo.all(query: query)
@@ -95,23 +100,36 @@ defmodule Plausible.Stats.Exploration do
   in the journey yet. Trailing slashes are ignored when 
   comparing pathnames (e.g. `/foo` and `/foo/` are treated as
   the same page - we should probably do that when deduplicating step candidates too).
+
+  ## Options
+
+    * `:max_steps` - maximum number of funnel steps to build (default: `6`)
+    * `:max_candidates` - passed to `next_steps/3`, limiting
+      how many candidate next steps are fetched per step (default: `10`)
   """
-  @spec interesting_funnel(Query.t(), pos_integer()) ::
+  @spec interesting_funnel(Query.t(), keyword()) ::
           {:ok, [funnel_step()]} | {:error, :not_found}
-  def interesting_funnel(query, max_steps \\ 6) do
-    case build_interesting_journey(query, [], MapSet.new(), max_steps) do
+  def interesting_funnel(query, opts \\ []) do
+    max_steps = min(Keyword.get(opts, :max_steps, 6), 20)
+    max_candidates = min(Keyword.get(opts, :max_candidates, 10), 20)
+
+    case build_interesting_journey(query, max_steps, max_candidates) do
       [] -> {:error, :not_found}
       journey -> journey_funnel(query, journey)
     end
   end
 
-  defp build_interesting_journey(_query, journey, _seen, max_steps)
+  defp build_interesting_journey(query, max_steps, max_candidates) do
+    do_build_journey(query, [], MapSet.new(), max_steps, max_candidates)
+  end
+
+  defp do_build_journey(_query, journey, _seen, max_steps, _max_candidates)
        when length(journey) >= max_steps do
     journey
   end
 
-  defp build_interesting_journey(query, journey, seen, max_steps) do
-    {:ok, candidates} = next_steps(query, journey, "")
+  defp do_build_journey(query, journey, seen, max_steps, max_candidates) do
+    {:ok, candidates} = next_steps(query, journey, max_candidates: max_candidates)
 
     case find_unseen_step(candidates, seen) do
       nil ->
@@ -119,7 +137,7 @@ defmodule Plausible.Stats.Exploration do
 
       step ->
         new_seen = MapSet.put(seen, normalize_step_key(step))
-        build_interesting_journey(query, journey ++ [step], new_seen, max_steps)
+        do_build_journey(query, journey ++ [step], new_seen, max_steps, max_candidates)
     end
   end
 
@@ -136,7 +154,8 @@ defmodule Plausible.Stats.Exploration do
   defp normalize_pathname("/"), do: "/"
   defp normalize_pathname(pathname), do: String.trim_trailing(pathname, "/")
 
-  defp next_steps_query(query, steps, search_term, direction) do
+  defp next_steps_query(query, steps, search_term, direction, max_candidates)
+       when is_direction(direction) do
     next_step_idx = length(steps) + 1
     q_steps = steps_query(query, next_step_idx, direction)
 
@@ -171,7 +190,7 @@ defmodule Plausible.Stats.Exploration do
           asc: selected_as(:next_pathname),
           asc: selected_as(:next_name)
         ],
-        limit: 10
+        limit: ^max_candidates
       )
       |> maybe_search(search_term)
 
