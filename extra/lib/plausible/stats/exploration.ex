@@ -182,10 +182,10 @@ defmodule Plausible.Stats.Exploration do
   defp normalize_pathname(pathname), do: String.trim_trailing(pathname, "/")
 
   @wildcard_array_join """
-  arrayFold(
+  if(? = 'pageview', arrayFold(
     acc, x -> arrayPushBack(acc, concat(acc[-1], '/', x)), 
     arraySlice(splitByChar('/', ?) AS split_pathname, 2), 
-    arraySlice(split_pathname, 1, 1))
+    arraySlice(split_pathname, 1, 1)), [?])
   """
 
   defp next_steps_query(query, steps, search_term, direction, max_candidates)
@@ -214,55 +214,75 @@ defmodule Plausible.Stats.Exploration do
         from(s in q, where: ^step_condition)
       end)
 
-    q_exact_matches =
-      from(m in q_matches,
-        select_merge: %{
-          visitors: scale_sample(fragment("uniq(?)", m.user_id)),
-          includes_subpaths: type(^false, :boolean),
-          subpaths_count: 0
-        },
-        group_by: [selected_as(:name), selected_as(:pathname)]
-      )
-
+    # Expand each (name, pathname, user_id) row into all prefix paths via
+    # ARRAY JOIN, then aggregate once to get both exact and wildcard visitor
+    # counts in a single scan of events_v2.
+    #
+    # The arrayFold expansion includes the original pathname as the last
+    # element, so uniqIf(user_id, original_pathname = prefix_pathname) gives the
+    # exact-match count for free, alongside the wildcard uniq(user_id) and the
+    # uniq(original_pathname) subpath count — all in one GROUP BY.
+    #
+    # Non-pageview events are included in the expansion but produce only a
+    # single prefix (their exact pathname), so they naturally get
+    # subpaths_count = 1 and are only emitted as exact rows.
     q_per_user_matches =
       from(m in q_matches,
         select_merge: %{user_id: m.user_id, _sample_factor: fragment("any(?)", m._sample_factor)},
         group_by: [selected_as(:name), selected_as(:pathname), m.user_id]
       )
 
-    q_wildcard_matches =
+    q_combined =
       from(em in subquery(q_per_user_matches),
-        join: pname in fragment(@wildcard_array_join, em.pathname),
+        join: pname in fragment(@wildcard_array_join, em.name, em.pathname, em.pathname),
         on: true,
         hints: "ARRAY",
-        where: em.name == "pageview",
         where: selected_as(:pathname) != "" and selected_as(:pathname) != "/",
         select: %{
           name: em.name,
           pathname: selected_as(fragment("?", pname), :pathname),
-          visitors: selected_as(scale_sample(fragment("uniq(?)", em.user_id)), :visitors),
-          unique_paths: scale_sample(fragment("uniq(?)", em.pathname))
+          exact_visitors:
+            scale_sample(fragment("uniqIf(?, ? = ?)", em.user_id, em.pathname, pname)),
+          wildcard_visitors:
+            selected_as(scale_sample(fragment("uniq(?)", em.user_id)), :wildcard_visitors),
+          subpaths_count: scale_sample(fragment("uniq(?)", em.pathname))
         },
         group_by: [em.name, selected_as(:pathname)]
       )
 
-    q_wildcard_filtered_matches =
-      from(wm in subquery(q_wildcard_matches),
-        left_join: emx in subquery(q_exact_matches),
-        on: emx.name == wm.name and emx.pathname == wm.pathname,
-        where: wm.unique_paths > 1 and (is_nil(emx.name) or wm.visitors != emx.visitors),
+    # Fan out each q_combined row into up to two output rows (exact + wildcard)
+    # using ARRAY JOIN over a small boolean array.
+    #
+    # For each row we build [false, true] and filter it down to just [false]
+    # when the wildcard row should be suppressed (non-pageview, only one distinct
+    # subpath, or same visitor count as exact). ARRAY JOIN then emits one or more
+    # rows per group. The joined boolean `is_wildcard` selects which values to
+    # use for visitors / includes_subpaths / subpaths_count.
+    q_all_matches =
+      from(m in subquery(q_combined),
+        join:
+          is_wildcard in fragment(
+            """
+            arrayFilter(
+              x -> x = false OR (? = 'pageview' AND ? > 1 AND ? != ?),
+              [false, true]
+            )
+            """,
+            m.name,
+            m.subpaths_count,
+            m.wildcard_visitors,
+            m.exact_visitors
+          ),
+        on: true,
+        hints: "ARRAY",
         select: %{
-          name: wm.name,
-          pathname: wm.pathname,
-          visitors: wm.visitors,
-          includes_subpaths: type(^true, :boolean),
-          subpaths_count: wm.unique_paths
+          name: m.name,
+          pathname: m.pathname,
+          visitors: fragment("if(?, ?, ?)", is_wildcard, m.wildcard_visitors, m.exact_visitors),
+          includes_subpaths: fragment("CAST(?, 'Bool')", is_wildcard),
+          subpaths_count: fragment("if(?, ?, 0)", is_wildcard, m.subpaths_count)
         }
       )
-
-    q_all_matches =
-      q_exact_matches
-      |> union_all(^q_wildcard_filtered_matches)
 
     from(m in subquery(q_all_matches),
       select: %{
@@ -360,8 +380,7 @@ defmodule Plausible.Stats.Exploration do
             fragment("if(? = '/', ?, trimRight(?, '/'))", e.pathname, e.pathname, e.pathname),
           timestamp: e.timestamp
         },
-        where: e.name != "engagement",
-        order_by: ^event_ordering
+        where: e.name != "engagement"
       )
       |> select_previous(direction)
 
@@ -374,8 +393,7 @@ defmodule Plausible.Stats.Exploration do
           name1: e.name,
           pathname1: e.pathname
         },
-        where: e.prev_name != e.name or e.prev_pathname != e.pathname,
-        order_by: ^event_ordering
+        where: e.prev_name != e.name or e.prev_pathname != e.pathname
       )
 
     if steps > 1 do
