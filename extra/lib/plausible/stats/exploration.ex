@@ -269,10 +269,15 @@ defmodule Plausible.Stats.Exploration do
           ),
         on: true,
         hints: "ARRAY",
+        where: selected_as(:visitors) > 0,
         select: %{
           name: m.name,
           pathname: m.pathname,
-          visitors: fragment("if(?, ?, ?)", is_wildcard, m.wildcard_visitors, m.exact_visitors),
+          visitors:
+            selected_as(
+              fragment("if(?, ?, ?)", is_wildcard, m.wildcard_visitors, m.exact_visitors),
+              :visitors
+            ),
           includes_subpaths: fragment("CAST(?, 'Bool')", is_wildcard),
           subpaths_count: fragment("if(?, ?, 0)", is_wildcard, m.subpaths_count)
         }
@@ -408,20 +413,19 @@ defmodule Plausible.Stats.Exploration do
   end
 
   defp steps_query(query, steps, direction) when is_integer(steps) do
-    event_ordering = [asc: :timestamp, asc: :name, asc: :pathname]
-
     q_pairs =
       from(e in query,
         windows: [
           session_window: [
             partition_by: e.user_id,
-            order_by: ^event_ordering
+            order_by: [asc: e.timestamp]
           ]
         ],
         select: %{
           site_id: e.site_id,
           user_id: e.user_id,
           _sample_factor: e._sample_factor,
+          row_number: row_number() |> over(:session_window),
           name: e.name,
           pathname:
             fragment("if(? = '/', ?, trimRight(?, '/'))", e.pathname, e.pathname, e.pathname),
@@ -433,7 +437,9 @@ defmodule Plausible.Stats.Exploration do
 
     q_steps =
       from(e in subquery(q_pairs),
-        windows: [step_window: [partition_by: e.user_id, order_by: ^event_ordering]],
+        windows: [
+          step_window: [partition_by: e.user_id, order_by: [asc: e.timestamp, asc: e.row_number]]
+        ],
         select: %{
           user_id: e.user_id,
           _sample_factor: e._sample_factor,
